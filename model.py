@@ -5,9 +5,6 @@ import torch.nn.functional as F
 import numbers
 from einops import rearrange
 
-# =========================
-# LayerNorm 与工具
-# =========================
 def to_3d(x):
     return rearrange(x, 'b c h w -> b (h w) c')
 
@@ -51,9 +48,6 @@ class LayerNorm(nn.Module):
         h, w = x.shape[-2:]
         return to_4d(self.body(to_3d(x)), h, w)
 
-# =========================
-# GDFN
-# =========================
 class FeedForward(nn.Module):
     def __init__(self, dim, ffn_expansion_factor, bias):
         super().__init__()
@@ -69,9 +63,6 @@ class FeedForward(nn.Module):
         x = self.project_out(x)
         return x
 
-# =========================
-# 注意力
-# =========================
 class Attention(nn.Module):
     def __init__(self, dim, num_heads, bias):
         super().__init__()
@@ -113,9 +104,6 @@ class TransformerBlock(nn.Module):
         x = x + self.ffn(self.norm2(x))
         return x
 
-# =========================
-# Patch Embedding & Resizing
-# =========================
 class OverlapPatchEmbed(nn.Module):
     def __init__(self, in_c=3, embed_dim=48, bias=False):
         super().__init__()
@@ -146,11 +134,7 @@ class Upsample(nn.Module):
     def forward(self, x):
         return self.body(x)
 
-# =========================
-# Prompt（暗光专用）
-# =========================
 class LowLightPromptBlock(nn.Module):
-    """面向暗光增强的可学习提示原语"""
     def __init__(self, prompt_dim=128, prompt_len=5, prompt_size=96, lin_dim=192):
         super().__init__()
         self.prompt_param = nn.Parameter(
@@ -170,9 +154,6 @@ class LowLightPromptBlock(nn.Module):
         prompt = self.conv3x3(prompt)
         return prompt
 
-# =========================================================
-# 小波 & MoE：暗光增强命名
-# =========================================================
 def _gaussian_kernel1d(sigma: float, radius: int = None, device=None, dtype=torch.float32):
     if radius is None:
         radius = int(3.0 * sigma + 0.5)
@@ -254,7 +235,6 @@ class HaarIWT(nn.Module):
         return out
 
 class IllumWTConv(nn.Module):
-    """面向光照表征的 DW3x3+PW1x1"""
     def __init__(self, in_ch, out_ch):
         super().__init__()
         self.dw = nn.Conv2d(in_ch, in_ch, 3, 1, 1, groups=in_ch, bias=False)
@@ -265,53 +245,31 @@ class IllumWTConv(nn.Module):
         x = self.pw(x)
         return x
 
-# === Drop-in replacement for LowLightWaveletMoEGate: Soft-MoE with two stability tricks ===
-# 软性MoE（softmax + 自层正偏置 + 温度），并实现两点小技巧：
-# 1) 对“其它层”的 H* 计算使用 no_grad，并对其特征停止梯度（detach），减少重入反传/显存开销；
-# 2) 跨层只做“读”：其它层的特征不回传梯度，但 q_proj / v_proj / gate 等路由参数仍可学习。
 class LowLightWaveletMoEGate(nn.Module):
-    """
-    Soft-MoE 版本（推荐）：
-      - 不再使用 min-max 和 tau 截断；
-      - 把“当前层”也纳入 softmax 权重，并给当前层加正偏置 bias0，保证自层优先；
-      - 使用温度 T 控制权重分布的尖锐度；
-      - 默认对 enc_others 的 H* 计算使用 no_grad，并对 Hs/enc_others 停止梯度，降低不稳定与显存开销。
-    """
-
     def __init__(self, in_ch_curr, prompt_ch,
                  sim_dim=32, sigma=1.0, beta=1.0,
-                 # Soft-MoE 关键超参
                  temperature=0.7, bias0=1.0,
-                 # 两点小技巧开关
                  detach_others: bool = True,
                  stop_grad_others: bool = True,
-                 # 向后兼容：允许老代码传 tau 或其它没用到的关键字
                  tau=None, **unused):
         super().__init__()
-        # 小波分析/重建
         self.dwt   = HaarDWT(in_ch_curr)
         self.iwt   = HaarIWT(in_ch_curr)
         self.beta  = beta
         self.sigma = sigma
 
-        # 相似度投影
         self.q_proj = nn.Conv2d(prompt_ch, sim_dim, 1, bias=False)
         self.v_proj = nn.Conv2d(1,         sim_dim, 1, bias=False)
 
-        # 显著性融合（Hw + Hlog -> H*）
         self.fuse   = nn.Conv2d(2, 1, 1, bias=True)
 
-        # 提示投影到 prompt_ch
         self.to_prompt = IllumWTConv(in_ch_curr, prompt_ch)
 
-        # 门控（跳连/提示）
         self.gate      = nn.Conv2d(1, 2, 1, bias=True)
 
-        # Soft-MoE 参数
         self.temperature = float(temperature)
         self.bias0       = float(bias0)
 
-        # 技巧：控制跨层梯度
         self.detach_others    = bool(detach_others)
         self.stop_grad_others = bool(stop_grad_others)
 
@@ -340,7 +298,6 @@ class LowLightWaveletMoEGate(nn.Module):
         eps = 1e-6
         B, C, H, W = enc_curr.shape
 
-        # 当前层 H*
         LL, HL, LH, HH = self.dwt(enc_curr)
         h2, w2 = LL.shape[-2:]
         Hw   = _wave_energy(HL, LH, HH)
@@ -350,7 +307,6 @@ class LowLightWaveletMoEGate(nn.Module):
         Hlog = _minmax(_laplacian(_gaussian_blur(LLup, self.sigma)).abs()).mean(dim=1, keepdim=True)
         Hcurr = torch.sigmoid(self.fuse(torch.cat([Hw, Hlog], dim=1)))  # (B,1,H,W)
 
-        # 其它层 H*
         H_others = []
         if len(enc_others) > 0:
             if self.detach_others:
@@ -368,7 +324,6 @@ class LowLightWaveletMoEGate(nn.Module):
             if self.stop_grad_others:
                 H_others = [h.detach() for h in H_others]
 
-        # Soft-MoE 权重
         Q = self.q_proj(prompt_feat)  # (B,sim,H,W)
         sims = [self._sim_l2norm(Q, Hcurr, self.v_proj)]
         for Hs in H_others:
@@ -387,7 +342,6 @@ class LowLightWaveletMoEGate(nn.Module):
         for i, Hs in enumerate(Hs_all):
             Hmix = Hmix + w[:, i:i+1] * Hs
 
-        # 小波域调制 & IWT
         Hlow  = F.interpolate(Hmix, size=(h2, w2), mode='bilinear', align_corners=False)
         scale = 1.0 + self.beta * Hlow
         HLm   = HL * scale
@@ -395,7 +349,6 @@ class LowLightWaveletMoEGate(nn.Module):
         HHm   = HH * scale
         recon = self.iwt(LL, HLm, LHm, HHm)
 
-        # 提示 + 门控
         wave_prompt = self.to_prompt(recon)
         gates       = torch.sigmoid(self.gate(Hmix))
         g_skip, g_prompt = gates[:, 0:1], gates[:, 1:2]
@@ -403,17 +356,7 @@ class LowLightWaveletMoEGate(nn.Module):
         return wave_prompt, g_skip, g_prompt
 
 
-# =========================================================
-# 多尺度树突 DNM（用于 L1-L3 融合）—— 3 路版
-# =========================================================
-# —— 替换你文件里的 MultiScaleDNM —— #
 class MultiScaleDNM(nn.Module):
-    """
-    多尺度树突神经元融合（3 路）
-    归一化策略：
-      - dendrite_norm: 在树突聚合 z (N, out_ch, M) 上，沿 M 维做 RMSNorm（无均值项），减少分支数/尺度的影响；
-      - soma_norm: 在胞体输出 v (B,C,H,W) 上，做 GroupNorm(1,C) ≈ LayerNorm2d。
-    """
     def __init__(self, in_dims, out_ch=96, M=4, activation='relu',
                  use_dendrite_norm=True, use_soma_norm=True, eps=1e-6):
         super().__init__()
@@ -424,8 +367,6 @@ class MultiScaleDNM(nn.Module):
         self.M        = M
         self.activation = activation
         self.eps = eps
-
-        # 可学习的线性权重（树突层）
         self.W = nn.ParameterList()
         self.q = nn.ParameterList()
         for d in self.in_dims:
@@ -434,18 +375,14 @@ class MultiScaleDNM(nn.Module):
             self.W.append(Wk)
             self.q.append(qk)
 
-        # 胞体线性
         self.soma_scale = nn.Parameter(torch.ones(out_ch))
         self.soma_bias  = nn.Parameter(torch.zeros(out_ch))
 
-        # 归一化模块
         self.use_dendrite_norm = use_dendrite_norm
         self.use_soma_norm     = use_soma_norm
         if self.use_soma_norm:
-            # GroupNorm(1,C) 等价于“按通道的 LayerNorm2d”
             self.soma_gn = nn.GroupNorm(1, out_ch)
 
-        # 树突归一（按 M 维的 RMSNorm，逐通道有可学习缩放）
         if self.use_dendrite_norm:
             self.dendrite_gamma = nn.Parameter(torch.ones(out_ch, 1))  # (C,1) 作用在 M 维归一后
 
@@ -463,7 +400,7 @@ class MultiScaleDNM(nn.Module):
         B, _, H, W = feats[0].shape
         N = B * H * W
 
-        syn_accum = None  # 将各路 z 按树突分支维累加
+        syn_accum = None
         for k, x in enumerate(feats):
             Bk, Ck, Hk, Wk = x.shape
             assert Hk == H and Wk == W, "All feats must share spatial size"
@@ -475,39 +412,32 @@ class MultiScaleDNM(nn.Module):
             qk = self.q[k]                                          # (C_out, M)
 
             # z: (N, C_out, M)
-            z = torch.einsum('nc,omc->nom', x_flat, Wk)             # 先线性
-            z = z - qk.unsqueeze(0)                                 # 偏置/阈值
+            z = torch.einsum('nc,omc->nom', x_flat, Wk)     
+            z = z - qk.unsqueeze(0)                         
             z = self._act(z)
 
-            # —— 树突归一：沿 M 维 RMSNorm，逐通道 gamma 缩放 —— #
             if self.use_dendrite_norm:
                 # rms over M: (N, C, 1)
                 rms = torch.sqrt(torch.mean(z * z, dim=2, keepdim=True) + self.eps)
-                z = z / rms                                          # 归一到单位 RMS
-                z = z * self.dendrite_gamma.unsqueeze(0)             # (1,C,1) 缩放
+                z = z / rms                                  
+                z = z * self.dendrite_gamma.unsqueeze(0)          
 
-            syn_accum = z if syn_accum is None else (syn_accum + z)  # 按路求和（仍是 N×C×M）
+            syn_accum = z if syn_accum is None else (syn_accum + z)  
 
-        # 胞体整合：沿 M 维求和 -> (N, C)
         v = syn_accum.sum(dim=2)
 
-        # 线性 + 激活
         v = v * self.soma_scale.unsqueeze(0) + self.soma_bias.unsqueeze(0)
         v = self._act(v)
 
-        # 回到 (B,C,H,W)
         v = v.view(B, H, W, self.out_ch).permute(0, 3, 1, 2).contiguous()
 
-        # —— 胞体输出再做一次通道归一 —— #
         if self.use_soma_norm:
             v = self.soma_gn(v)
 
         return v
 
-# ========================
-# 主干网络（在 L3/L2/L1 注入小波 Prompt + 末端 3 路 DNM 融合）
-# =========================
-class PromptIR(nn.Module):
+
+class WDNet(nn.Module):
     def __init__(self,
         inp_channels=3,
         out_channels=3,
@@ -524,7 +454,6 @@ class PromptIR(nn.Module):
         self.decoder = decoder
         self.patch_embed = OverlapPatchEmbed(inp_channels, dim)
 
-        # ---- Prompt（3 个：H/2, H/4, H/8）----
         if self.decoder:
             self.prompt1 = LowLightPromptBlock(prompt_dim=64,  prompt_len=5, prompt_size=64, lin_dim=96)
             self.prompt2 = LowLightPromptBlock(prompt_dim=128, prompt_len=5, prompt_size=32, lin_dim=192)
@@ -534,12 +463,10 @@ class PromptIR(nn.Module):
             self.p2_align = nn.Conv2d(128,  64, kernel_size=1, bias=False)  # for L2/L1
             self.p1_align = nn.Conv2d( 64,  64, kernel_size=1, bias=False)  # identity
 
-        # 接口兼容的 1×1（保留）
         self.chnl_reduce1 = nn.Conv2d( 64,  64, 1, bias=bias)
         self.chnl_reduce2 = nn.Conv2d(128, 128, 1, bias=bias)
         self.chnl_reduce3 = nn.Conv2d(320, 256, 1, bias=bias)
 
-        # ========= Encoder =========
         self.reduce_noise_channel_1 = nn.Conv2d(dim + 64, dim, 1, bias=bias)
         self.encoder_level1 = nn.Sequential(*[
             TransformerBlock(dim=dim, num_heads=heads[0],
@@ -574,7 +501,6 @@ class PromptIR(nn.Module):
             for _ in range(num_blocks[3])
         ])
 
-        # ========= Decoder 顶层 =========
         self.up4_3 = Upsample(int(dim*2**3))                         # 384 -> 192
         self.reduce_chan_level3 = nn.Conv2d(int(dim*2**2)*2,
                                             int(dim*2**2), 1, bias=bias)  # 384->192
@@ -644,10 +570,8 @@ class PromptIR(nn.Module):
             for _ in range(num_refinement_blocks)
         ])
 
-        # 原始输出头（in_ch = 2*dim，例如 96）
         self.output = nn.Conv2d(int(dim*2**1), out_channels, 3, 1, 1, bias=bias)
 
-        # ---------- 暗光：小波提示 ----------
         if self.decoder:
             self.wave_prompt_l3 = LowLightWaveletMoEGate(in_ch_curr=int(dim*2**2),
                                                          prompt_ch=128,
@@ -662,7 +586,6 @@ class PromptIR(nn.Module):
                                                          sim_dim=32, sigma=1.0,
                                                          beta=1.0, tau=0.2)
 
-        # ---------- 末端多尺度 DNM：仅融合 decoder 三层（dec1/dec2/dec3） ----------
         # dec1: 96 (H), dec2: 96 (H/2), dec3: 192 (H/4)
         self.dnm_fusion = MultiScaleDNM(
             in_dims=[int(dim*2**1),  # dec1
@@ -673,26 +596,22 @@ class PromptIR(nn.Module):
             activation='relu'
         )
 
-        # 逐尺度轻量归一（GroupNorm，3 路）
         self.dnm_norm_dec1 = nn.GroupNorm(1, int(dim * 2 ** 1))  # 96
         self.dnm_norm_dec2 = nn.GroupNorm(1, int(dim * 2 ** 1))  # 96
         self.dnm_norm_dec3 = nn.GroupNorm(1, int(dim * 2 ** 2))  # 192
 
-        # 尺度 SE（3 个尺度 -> 3 个系数），拼接后全局池化 + 两层 1x1
         se_in_ch = int(dim * 2 ** 1) + int(dim * 2 ** 1) + int(dim * 2 ** 2)  # 96+96+192=384
         self.scale_se = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(se_in_ch, 64, 1, bias=True),
             nn.GELU(),
-            nn.Conv2d(64, 3, 1, bias=True),  # 输出 3 个权重
+            nn.Conv2d(64, 3, 1, bias=True),
             nn.Sigmoid()
         )
 
-        # DNM 残差门控（σ(gate)∈(0,1)，初始化为很小值 ≈ 0.12）
         self.dnm_gate = nn.Parameter(torch.tensor(-2.0))  # alpha = sigmoid(-2) ~ 0.119
 
     def forward(self, inp_img, noise_emb=None):
-        # ========== Encoder ==========
         x1 = self.patch_embed(inp_img)                 # 3 -> 48
         e1 = self.encoder_level1(x1)                   # H,   C=48
 
@@ -705,15 +624,13 @@ class PromptIR(nn.Module):
         x4  = self.down3_4(e3)                         # H/8, C=384
         lat = self.latent(x4)                          # H/8, C=384
 
-        # ---------- latent（H/8）生成 prompt3，并注入 ----------
         if self.decoder:
             p3  = self.prompt3(lat)                    # B,320,H/8,W/8
             lat = torch.cat([lat, p3], dim=1)          # 384+320=704
             lat = self.noise_level3(lat)               # 704
-            lat = self.reduce_noise_level3(lat)        # 704 -> 384 (解码 L4)
-        # dec4 = lat                                     # decoder L4 特征: B,384,H/8（不进 DNM，仅供上层使用）
+            lat = self.reduce_noise_level3(lat)       
+        # dec4 = lat                                
 
-        # ========== Decoder L3（H/4）==========
         d3 = self.up4_3(lat)                           # H/8 -> H/4, C: 384->192
         d3 = torch.cat([d3, e3], dim=1)                # B,384,H/4
         d3 = self.reduce_chan_level3(d3)               # -> B,192,H/4
@@ -737,7 +654,6 @@ class PromptIR(nn.Module):
 
         p2 = self.prompt2(d3)                          # B,128,H/4
 
-        # ========== Decoder L2（H/2）==========
         d2 = self.up3_2(d3)                            # H/4 -> H/2, C: 192->96
         d2 = torch.cat([d2, e2], dim=1)                # B,192,H/2
         d2 = self.reduce_chan_level2(d2)               # -> B,96,H/2
@@ -761,7 +677,6 @@ class PromptIR(nn.Module):
 
         p1 = self.prompt1(d2)                          # B,64,H/2
 
-        # ========== Decoder L1（H）==========
         d1 = self.up2_1(d2)                            # H/2 -> H, C: 96->48
         d1 = torch.cat([d1, e1], dim=1)                # B,96,H
 
@@ -780,22 +695,18 @@ class PromptIR(nn.Module):
             d1  = self.noise_level0(d1)                # B,224,H
             d1  = self.reduce_noise_level0(d1)         # -> B,96,H
 
-        # 可按需启用/关闭这两行：
         d1 = self.decoder_level1(d1)
         # d1 = self.refinement(d1)
         dec1 = d1  # decoder L1: B,96,H
 
-        # ========== 多尺度 DNM 融合（仅 dec1/dec2/dec3） + 归一/SE 重标定 + 门控 ==========
         B, C1, H, W = dec1.shape
         dec2_up = F.interpolate(dec2, size=(H, W), mode='bilinear', align_corners=False)
         dec3_up = F.interpolate(dec3, size=(H, W), mode='bilinear', align_corners=False)
 
-        # 逐尺度归一
         dec1_n = self.dnm_norm_dec1(dec1)
         dec2_n = self.dnm_norm_dec2(dec2_up)
         dec3_n = self.dnm_norm_dec3(dec3_up)
 
-        # 尺度 SE：得到 B×3×1×1 的权重
         cat_all = torch.cat([dec1_n, dec2_n, dec3_n], dim=1)
         w = self.scale_se(cat_all)  # B,3,1,1
         w1, w2, w3 = w[:, 0:1], w[:, 1:2], w[:, 2:3]
@@ -804,16 +715,12 @@ class PromptIR(nn.Module):
         dec2_w = dec2_n * w2
         dec3_w = dec3_n * w3
 
-        # DNM 融合（稳态输入）
         fused_raw = self.dnm_fusion([dec1_w, dec2_w, dec3_w])  # B,96,H,W
 
-        # 残差门控融合：y = dec1 + α * fused_raw
         alpha = torch.sigmoid(self.dnm_gate)
         fused = dec1 + alpha * fused_raw
 
-        # 抛光
         fused = self.refinement(fused)
 
-        # 输出头 + 残差到图像域
         out = self.output(fused) + inp_img
         return out
