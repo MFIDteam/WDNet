@@ -15,7 +15,7 @@ import lightning.pytorch as pl
 from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 
-from net.model import PromptIR
+from net.model import WDNet
 from utils.val_utils import compute_psnr_ssim  # PSNR/SSIM utility
 from torchvision.transforms import functional as TF
 from utils.swt_loss_simple import SWTLoss
@@ -193,7 +193,7 @@ class LowLightModule(pl.LightningModule):
                  lpips_warmup_steps=5000, lpips_ramp_steps=15000):
         super().__init__()
         self.save_hyperparameters(ignore=['save_images_dir'])
-        self.net = PromptIR()
+        self.net = WDNet()
 
         self.crit = CompositeLoss(lambda_charb=w_charb, lambda_ssim=w_ssim,
                                   lambda_grad=w_grad, lambda_swt=w_swt, lambda_lpips=0.0)
